@@ -1,0 +1,10 @@
+venv/
+outputs/
+src/outputs/
+__pycache__/
+*.pyc
+Phase_documentation.md
+features_planning.md
+next_steps.md
+src/source/
+src/file.png
