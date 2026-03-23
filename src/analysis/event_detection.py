@@ -75,6 +75,7 @@ def detect_events_for_clip(
     min_gap_frames = max(4, int(round(0.28 * use_fps)))
 
     peaks = 0
+    peak_speeds_list: list[float] = []
     last_peak = -10**9
     for i in range(1, len(smooth_speed) - 1):
         if valid_speed[i] == 0:
@@ -84,22 +85,30 @@ def detect_events_for_clip(
         far_enough = (i - last_peak) >= min_gap_frames
         if is_peak and strong and far_enough:
             peaks += 1
+            peak_speeds_list.append(float(smooth_speed[i]))
             last_peak = i
+
+    # Smash estimation: peaks significantly above the average motion baseline.
+    smash_threshold = max(base + 2.5 * spread, threshold * 1.8, 0.80)
+    smash_count = sum(1 for s in peak_speeds_list if s >= smash_threshold)
 
     shot_count = max(1, peaks) if int(np.sum(valid_speed)) >= 10 else peaks
     confidence = min(1.0, 0.35 + 0.45 * tracking.visible_ratio + 0.20 * min(1.0, peaks / 8.0))
 
     notes = [
-        f"Shot-count estimate from motion peaks above dynamic threshold ({threshold:.3f}).",
-        "Smash estimation pending next phase.",
+        f"Shot-count from motion peaks above dynamic threshold ({threshold:.3f}).",
+        f"Smash estimate from high-speed peaks above threshold ({smash_threshold:.3f}).",
     ]
     if debug:
-        notes.append(f"Used fps={use_fps:.2f}, min_gap_frames={min_gap_frames}, detected_peaks={peaks}.")
+        notes.append(
+            f"fps={use_fps:.2f}, min_gap_frames={min_gap_frames}, "
+            f"detected_peaks={peaks}, smash_count={smash_count}."
+        )
 
     return EventDetectionResult(
         status="ready",
         shot_count_estimate=int(shot_count),
-        smash_count_estimate=None,
+        smash_count_estimate=int(smash_count),
         confidence=float(confidence),
         notes=notes,
     )

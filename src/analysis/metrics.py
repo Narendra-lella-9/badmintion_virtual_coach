@@ -10,6 +10,10 @@ from .event_detection import EventDetectionResult
 from .io_schema import MatchAnalysisSummary, PointAnalysisResult
 from .player_tracking import PlayerTrackingResult
 
+# Standard badminton court dimensions (doubles).
+COURT_LENGTH_M: float = 13.4  # baseline to baseline
+COURT_WIDTH_M: float = 6.1    # doubles side-line to side-line
+
 
 def extract_video_timing(clip_path: Path) -> tuple[float, int, float]:
     cap = cv2.VideoCapture(str(clip_path))
@@ -110,6 +114,33 @@ def _compute_speed_metrics(
     return float(sum(speeds) / len(speeds)), float(max(speeds))
 
 
+def _compute_speed_metrics_mps(
+    positions: list[tuple[float, float] | None],
+    fps: float,
+    court_length_m: float = COURT_LENGTH_M,
+    court_width_m: float = COURT_WIDTH_M,
+) -> tuple[float | None, float | None]:
+    """Convert normalized-position speed to real-world m/s using court dimensions."""
+    if fps <= 0:
+        return None, None
+
+    speeds_mps = []
+    prev = None
+    for position in positions:
+        if position is None:
+            prev = None
+            continue
+        if prev is not None:
+            dx_m = (position[0] - prev[0]) * court_width_m
+            dy_m = (position[1] - prev[1]) * court_length_m
+            speeds_mps.append(float(np.sqrt(dx_m * dx_m + dy_m * dy_m) * fps))
+        prev = position
+
+    if not speeds_mps:
+        return None, None
+    return float(sum(speeds_mps) / len(speeds_mps)), float(max(speeds_mps))
+
+
 def create_court_heatmap(
     trajectories: list[list[tuple[float, float] | None]],
     output_path: Path,
@@ -139,11 +170,55 @@ def create_court_heatmap(
     heat_norm = np.clip((heat / max_value) * 255.0, 0.0, 255.0).astype(np.uint8)
     heat_color = cv2.applyColorMap(heat_norm, cv2.COLORMAP_JET)
 
+    # Draw an approximate badminton court layout in normalized court space.
+    # Court length and width are used only for line placement ratios.
+    court_length_m = 13.4
+    singles_width_ratio = 5.18 / 6.1
+    short_service_ratio = 1.98 / court_length_m
+    long_service_doubles_ratio = (court_length_m - 0.76) / court_length_m
+
+    margin = 14
+    top = margin
+    bottom = size - margin
+    left = margin
+    right = size - margin
+    center_x = (left + right) // 2
+    net_y = (top + bottom) // 2
+
+    half_extra = (1.0 - singles_width_ratio) * 0.5
+    singles_left = int(round(left + (right - left) * half_extra))
+    singles_right = int(round(right - (right - left) * half_extra))
+
+    top_short_service_y = int(round(net_y - (bottom - top) * short_service_ratio))
+    bottom_short_service_y = int(round(net_y + (bottom - top) * short_service_ratio))
+    top_long_service_y = int(round(top + (bottom - top) * (1.0 - long_service_doubles_ratio)))
+    bottom_long_service_y = int(round(top + (bottom - top) * long_service_doubles_ratio))
+
     canvas = np.zeros((size, size, 3), dtype=np.uint8)
-    cv2.rectangle(canvas, (5, 5), (size - 6, size - 6), (180, 180, 180), 2)
-    cv2.line(canvas, (size // 2, 5), (size // 2, size - 6), (130, 130, 130), 1)
-    cv2.line(canvas, (5, int(size * 0.35)), (size - 6, int(size * 0.35)), (130, 130, 130), 1)
-    cv2.line(canvas, (5, int(size * 0.65)), (size - 6, int(size * 0.65)), (130, 130, 130), 1)
+    line_color = (185, 185, 200)
+    accent_color = (225, 225, 240)
+
+    # Outer court boundary.
+    cv2.rectangle(canvas, (left, top), (right, bottom), accent_color, 2)
+
+    # Singles side lines.
+    cv2.line(canvas, (singles_left, top), (singles_left, bottom), line_color, 1)
+    cv2.line(canvas, (singles_right, top), (singles_right, bottom), line_color, 1)
+
+    # Net line.
+    cv2.line(canvas, (left, net_y), (right, net_y), accent_color, 2)
+
+    # Short service lines on both halves.
+    cv2.line(canvas, (singles_left, top_short_service_y), (singles_right, top_short_service_y), line_color, 1)
+    cv2.line(canvas, (singles_left, bottom_short_service_y), (singles_right, bottom_short_service_y), line_color, 1)
+
+    # Doubles long service guide lines near the back, useful for reading coverage depth.
+    cv2.line(canvas, (left, top_long_service_y), (right, top_long_service_y), (110, 110, 140), 1)
+    cv2.line(canvas, (left, bottom_long_service_y), (right, bottom_long_service_y), (110, 110, 140), 1)
+
+    # Center service lines split left/right service boxes.
+    cv2.line(canvas, (center_x, top), (center_x, top_short_service_y), line_color, 1)
+    cv2.line(canvas, (center_x, bottom_short_service_y), (center_x, bottom), line_color, 1)
 
     overlay = cv2.addWeighted(canvas, 0.35, heat_color, 0.65, 0.0)
     cv2.putText(
@@ -174,6 +249,11 @@ def build_point_analysis(
     area_covered_norm = _compute_convex_hull_area(metric_positions)
     path_length_norm = _compute_path_length(metric_positions)
     speed_avg_norm_per_sec, speed_max_norm_per_sec = _compute_speed_metrics(metric_positions, fps)
+
+    if calibration.coordinate_system == "court_normalized":
+        speed_avg_mps, speed_max_mps = _compute_speed_metrics_mps(metric_positions, fps)
+    else:
+        speed_avg_mps, speed_max_mps = None, None
 
     quality_flags = []
     if calibration.coordinate_system != "court_normalized":
@@ -212,6 +292,8 @@ def build_point_analysis(
         court_calibration_status=calibration.status,
         tracking_status=tracking.status,
         notes=notes,
+        speed_avg_mps=speed_avg_mps,
+        speed_max_mps=speed_max_mps,
     )
 
 
@@ -229,9 +311,10 @@ def build_match_summary(point_results: list[PointAnalysisResult]) -> MatchAnalys
     if any(result.shots_est is None for result in point_results):
         warnings.append("Shot counting unavailable for some rallies due to low tracking quality.")
     if any(result.smash_count_est is None for result in point_results):
-        warnings.append("Smash estimation is still pending implementation.")
+        warnings.append("Smash count unavailable for some low-quality rallies.")
 
     speed_max_values = [result.speed_max_norm_per_sec for result in point_results if result.speed_max_norm_per_sec is not None]
+    speed_max_mps_values = [result.speed_max_mps for result in point_results if result.speed_max_mps is not None]
 
     return MatchAnalysisSummary(
         total_rallies=len(point_results),
@@ -246,5 +329,7 @@ def build_match_summary(point_results: list[PointAnalysisResult]) -> MatchAnalys
             if any(result.smash_count_est is not None for result in point_results)
             else None
         ),
+        avg_speed_mps=_average_numeric([result.speed_avg_mps for result in point_results]),
+        max_speed_mps=max(speed_max_mps_values) if speed_max_mps_values else None,
         analysis_warnings=warnings,
     )

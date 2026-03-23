@@ -9,6 +9,8 @@ from typing import Any
 
 import gradio as gr
 import imageio_ffmpeg
+import matplotlib.pyplot as plt
+import numpy as np
 
 from analysis import (
     build_match_summary,
@@ -202,17 +204,20 @@ def _load_point_metadata(chunks_dir: Path) -> dict[str, dict[str, float]]:
     return metadata
 
 
-def run_phase2_analysis(output_dir_text: str) -> tuple[str, dict[str, Any], list[str], str | None, str]:
+def run_phase2_analysis(output_dir_text: str) -> tuple[str, dict[str, Any], list[str], str | None, str, list[list[Any]], plt.Figure, plt.Figure, plt.Figure, plt.Figure]:
     if not output_dir_text:
-        return "No output folder selected. Run 'Process Video' first.", {}, [], None, ""
+        empty_fig = _empty_figure("No output folder selected")
+        return "No output folder selected. Run 'Process Video' first.", {}, [], None, "", [], empty_fig, empty_fig, empty_fig, empty_fig
 
     chunks_dir = Path(output_dir_text)
     if not chunks_dir.exists():
-        return f"Output folder does not exist: {chunks_dir}", {}, [], None, ""
+        empty_fig = _empty_figure(f"Folder not found: {chunks_dir}")
+        return f"Output folder does not exist: {chunks_dir}", {}, [], None, "", [], empty_fig, empty_fig, empty_fig, empty_fig
 
     point_clips = sorted(chunks_dir.glob("point_*/point_*.mp4"))
     if not point_clips:
-        return f"No rally clips found in: {chunks_dir}", {}, [], None, ""
+        empty_fig = _empty_figure("No rally clips found")
+        return f"No rally clips found in: {chunks_dir}", {}, [], None, "", [], empty_fig, empty_fig, empty_fig, empty_fig
 
     point_metadata = _load_point_metadata(chunks_dir)
     point_results = []
@@ -254,13 +259,148 @@ def run_phase2_analysis(output_dir_text: str) -> tuple[str, dict[str, Any], list
 
     status = (
         f"Phase 2 analysis completed. Rallies analyzed: {len(point_results)} | "
-        f"Summary file: {analysis_dir / 'analysis_match_summary.json'}"
+        f"Summary: {analysis_dir / 'analysis_match_summary.json'}"
     )
+
+    def _fmt(val: Any, decimals: int = 2) -> str:
+        return "N/A" if val is None else f"{val:.{decimals}f}"
+
+    avg_speed_str = (
+        f"{match_summary.avg_speed_mps:.2f} m/s"
+        if match_summary.avg_speed_mps is not None
+        else _fmt(match_summary.avg_speed_norm_per_sec, 3) + " norm/s"
+    )
+    max_speed_str = (
+        f"{match_summary.max_speed_mps:.2f} m/s"
+        if match_summary.max_speed_mps is not None
+        else _fmt(match_summary.max_speed_norm_per_sec, 3) + " norm/s"
+    )
+
     stats_text = (
-        f"Average rally shots count: {match_summary.avg_shots_per_rally if match_summary.avg_shots_per_rally is not None else 'N/A'}\n"
-        f"Average speed: {match_summary.avg_speed_norm_per_sec if match_summary.avg_speed_norm_per_sec is not None else 'N/A'} (normalized units/sec)"
+        f"Rallies analyzed:        {len(point_results)}\n"
+        f"Avg shots / rally:       {_fmt(match_summary.avg_shots_per_rally, 1)}\n"
+        f"Avg smashes / rally:     {_fmt(match_summary.avg_smashes_per_rally, 1)}\n"
+        f"Total smashes est:       {match_summary.total_smashes_est if match_summary.total_smashes_est is not None else 'N/A'}\n"
+        f"Avg player speed:        {avg_speed_str}\n"
+        f"Peak player speed:       {max_speed_str}\n"
+        f"Avg area covered (norm): {_fmt(match_summary.avg_area_covered_norm, 4)}"
     )
-    return status, asdict(match_summary), files, heatmap_output, stats_text
+
+    # Build per-point analytics table (list of lists for gr.Dataframe).
+    table_rows = []
+    for r in point_results:
+        if r.speed_avg_mps is not None:
+            spd_str = f"{r.speed_avg_mps:.2f} m/s"
+        elif r.speed_avg_norm_per_sec is not None:
+            spd_str = f"{r.speed_avg_norm_per_sec:.3f} n/s"
+        else:
+            spd_str = "N/A"
+        table_rows.append([
+            r.point_name,
+            f"{r.duration_sec:.1f}",
+            str(r.shots_est) if r.shots_est is not None else "N/A",
+            str(r.smash_count_est) if r.smash_count_est is not None else "N/A",
+            spd_str,
+            f"{r.area_covered_norm:.4f}" if r.area_covered_norm is not None else "N/A",
+            r.court_calibration_status,
+        ])
+
+    shots_chart = _build_shots_chart(point_results)
+    speed_chart = _build_speed_chart(point_results)
+    area_chart = _build_area_chart(point_results)
+    duration_chart = _build_duration_chart(point_results)
+
+    return status, asdict(match_summary), files, heatmap_output, stats_text, table_rows, shots_chart, speed_chart, area_chart, duration_chart
+
+
+def select_clip(point_name: str, video_map: dict[str, str]) -> str | None:
+    if not point_name:
+        return None
+    return video_map.get(point_name)
+
+
+def _build_shots_chart(point_results: list[Any]) -> plt.Figure:
+    """Create bar chart for shots per point."""
+    point_names = [r.point_name for r in point_results]
+    shots_data = [r.shots_est if r.shots_est is not None else 0 for r in point_results]
+    smashes_data = [r.smash_count_est if r.smash_count_est is not None else 0 for r in point_results]
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    x = np.arange(len(point_names))
+    width = 0.35
+    ax.bar(x - width / 2, shots_data, width, label="Shots", color="steelblue")
+    ax.bar(x + width / 2, smashes_data, width, label="Smashes", color="coral")
+    ax.set_xlabel("Rally")
+    ax.set_ylabel("Count")
+    ax.set_title("Shot Count per Rally")
+    ax.set_xticks(x)
+    ax.set_xticklabels(point_names, rotation=45, ha="right")
+    ax.legend()
+    ax.grid(axis="y", alpha=0.3)
+    plt.tight_layout()
+    return fig
+
+
+def _build_speed_chart(point_results: list[Any]) -> plt.Figure:
+    """Create line chart for speed progression."""
+    point_names = [r.point_name for r in point_results]
+    avg_speeds = [r.speed_avg_mps if r.speed_avg_mps is not None else r.speed_avg_norm_per_sec for r in point_results]
+    max_speeds = [r.speed_max_mps if r.speed_max_mps is not None else r.speed_max_norm_per_sec for r in point_results]
+
+    unit_label = "m/s" if avg_speeds and point_results[0].speed_avg_mps is not None else "norm/s"
+    fig, ax = plt.subplots(figsize=(10, 5))
+    x = np.arange(len(point_names))
+    ax.plot(x, avg_speeds, marker="o", label="Avg Speed", color="green", linewidth=2)
+    ax.plot(x, max_speeds, marker="s", label="Peak Speed", color="red", linewidth=2, linestyle="--")
+    ax.set_xlabel("Rally")
+    ax.set_ylabel(f"Speed ({unit_label})")
+    ax.set_title(f"Player Speed per Rally ({unit_label})")
+    ax.set_xticks(x)
+    ax.set_xticklabels(point_names, rotation=45, ha="right")
+    ax.legend()
+    ax.grid(alpha=0.3)
+    plt.tight_layout()
+    return fig
+
+
+def _build_area_chart(point_results: list[Any]) -> plt.Figure:
+    """Create bar chart for area covered per point."""
+    point_names = [r.point_name for r in point_results]
+    area_data = [r.area_covered_norm if r.area_covered_norm is not None else 0.0 for r in point_results]
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.bar(point_names, area_data, color="purple", alpha=0.7)
+    ax.set_xlabel("Rally")
+    ax.set_ylabel("Normalized Area")
+    ax.set_title("Court Area Covered per Rally (normalized)")
+    ax.set_xticklabels(point_names, rotation=45, ha="right")
+    ax.grid(axis="y", alpha=0.3)
+    plt.tight_layout()
+    return fig
+
+
+def _build_duration_chart(point_results: list[Any]) -> plt.Figure:
+    """Create bar chart for rally duration."""
+    point_names = [r.point_name for r in point_results]
+    durations = [r.duration_sec for r in point_results]
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.bar(point_names, durations, color="teal", alpha=0.7)
+    ax.set_xlabel("Rally")
+    ax.set_ylabel("Duration (seconds)")
+    ax.set_title("Rally Duration")
+    ax.set_xticklabels(point_names, rotation=45, ha="right")
+    ax.grid(axis="y", alpha=0.3)
+    plt.tight_layout()
+    return fig
+
+
+def _empty_figure(title: str = "No Data") -> plt.Figure:
+    """Create an empty matplotlib figure with a message."""
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.text(0.5, 0.5, title, ha="center", va="center", transform=ax.transAxes, fontsize=14)
+    ax.axis("off")
+    return fig
 
 
 def select_clip(point_name: str, video_map: dict[str, str]) -> str | None:
@@ -323,7 +463,21 @@ def create_app() -> gr.Blocks:
             )
             run_analysis_button = gr.Button("Run Phase 2 Analysis")
             analysis_status_output = gr.Textbox(label="Analysis Status", interactive=False)
-            analysis_stats_output = gr.Textbox(label="Key Metrics", interactive=False)
+            analysis_stats_output = gr.Textbox(label="Key Metrics", interactive=False, lines=7)
+            analysis_table_output = gr.Dataframe(
+                label="Per-Point Analytics",
+                headers=["Point", "Duration(s)", "Shots", "Smashes", "Avg Speed", "Area(norm)", "Calibration"],
+                interactive=False,
+            )
+
+            with gr.Row():
+                shots_chart = gr.Plot(label="Rally Shots & Smashes")
+                speed_chart = gr.Plot(label="Player Speed Progression")
+
+            with gr.Row():
+                area_chart = gr.Plot(label="Court Area Coverage")
+                duration_chart = gr.Plot(label="Rally Duration")
+
             analysis_summary_output = gr.JSON(label="Analysis Match Summary")
             analysis_heatmap_output = gr.Image(label="Court Coverage Heatmap", type="filepath")
             analysis_files_output = gr.Files(label="Analysis Output Files")
@@ -368,6 +522,11 @@ def create_app() -> gr.Blocks:
                 analysis_files_output,
                 analysis_heatmap_output,
                 analysis_stats_output,
+                analysis_table_output,
+                shots_chart,
+                speed_chart,
+                area_chart,
+                duration_chart,
             ],
         )
 

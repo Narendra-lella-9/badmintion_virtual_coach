@@ -26,6 +26,8 @@ class PointAnalysisResult:
     court_calibration_status: str = "pending"
     tracking_status: str = "pending"
     notes: list[str] = field(default_factory=list)
+    speed_avg_mps: float | None = None
+    speed_max_mps: float | None = None
 
 
 @dataclass
@@ -39,6 +41,8 @@ class MatchAnalysisSummary:
     avg_smashes_per_rally: float | None
     total_smashes_est: int | None
     heatmap_image: str | None = None
+    avg_speed_mps: float | None = None
+    max_speed_mps: float | None = None
     analysis_warnings: list[str] = field(default_factory=list)
 
 
@@ -69,6 +73,8 @@ def write_analysis_outputs(
         "speed_avg_norm_per_sec",
         "speed_max_norm_per_sec",
         "smash_count_est",
+        "speed_avg_mps",
+        "speed_max_mps",
         "metric_confidence",
         "court_calibration_status",
         "tracking_status",
