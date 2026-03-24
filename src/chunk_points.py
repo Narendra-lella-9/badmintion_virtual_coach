@@ -52,6 +52,79 @@ def moving_average(values: np.ndarray, window: int) -> np.ndarray:
     return np.convolve(values, kernel, mode="same")
 
 
+def _decode_segments_from_active(
+    active: np.ndarray,
+    fps: float,
+    config: DetectorConfig,
+) -> List[Segment]:
+    start_confirm = max(1, int(round(config.start_confirm_sec * fps)))
+    end_confirm = max(1, int(round(config.end_confirm_sec * fps)))
+    min_rally = max(1, int(round(config.min_rally_sec * fps)))
+    min_gap = max(1, int(round(config.min_gap_sec * fps)))
+
+    segments: List[Segment] = []
+    in_rally = False
+    start_frame = 0
+    active_run = 0
+    idle_run = 0
+    last_end = -10**9
+
+    for index, is_active in enumerate(active):
+        if is_active:
+            active_run += 1
+            idle_run = 0
+        else:
+            idle_run += 1
+            active_run = 0
+
+        if not in_rally:
+            enough_gap = index - last_end >= min_gap
+            if enough_gap and active_run >= start_confirm:
+                start_frame = index - start_confirm + 1
+                in_rally = True
+                active_run = 0
+                idle_run = 0
+        else:
+            if idle_run >= end_confirm:
+                end_frame = index - end_confirm
+                if end_frame - start_frame + 1 >= min_rally:
+                    segments.append(Segment(start_frame=start_frame, end_frame=end_frame))
+                    last_end = end_frame
+                in_rally = False
+                active_run = 0
+                idle_run = 0
+
+    if in_rally:
+        end_frame = len(active) - 1
+        if end_frame - start_frame + 1 >= min_rally:
+            segments.append(Segment(start_frame=start_frame, end_frame=end_frame))
+
+    merged: List[Segment] = []
+    merge_gap = int(round(0.8 * fps))
+    for segment in segments:
+        if not merged:
+            merged.append(segment)
+            continue
+        prev = merged[-1]
+        if segment.start_frame - prev.end_frame <= merge_gap:
+            merged[-1] = Segment(start_frame=prev.start_frame, end_frame=segment.end_frame)
+        else:
+            merged.append(segment)
+
+    return merged
+
+
+def decode_segments_from_smooth(
+    smooth: np.ndarray,
+    fps: float,
+    config: DetectorConfig,
+) -> List[Segment]:
+    if len(smooth) == 0:
+        return []
+    active = smooth >= config.threshold
+    return _decode_segments_from_active(active, fps, config)
+
+
 def extract_frame_features(video_path: Path) -> tuple[dict[str, np.ndarray], float, int, int, int]:
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -233,63 +306,7 @@ def decode_segments(
         return []
 
     smooth = moving_average(activity_prob, max(1, config.smooth_window_frames))
-    active = smooth >= config.threshold
-
-    start_confirm = max(1, int(round(config.start_confirm_sec * fps)))
-    end_confirm = max(1, int(round(config.end_confirm_sec * fps)))
-    min_rally = max(1, int(round(config.min_rally_sec * fps)))
-    min_gap = max(1, int(round(config.min_gap_sec * fps)))
-
-    segments: List[Segment] = []
-    in_rally = False
-    start_frame = 0
-    active_run = 0
-    idle_run = 0
-    last_end = -10**9
-
-    for index, is_active in enumerate(active):
-        if is_active:
-            active_run += 1
-            idle_run = 0
-        else:
-            idle_run += 1
-            active_run = 0
-
-        if not in_rally:
-            enough_gap = index - last_end >= min_gap
-            if enough_gap and active_run >= start_confirm:
-                start_frame = index - start_confirm + 1
-                in_rally = True
-                active_run = 0
-                idle_run = 0
-        else:
-            if idle_run >= end_confirm:
-                end_frame = index - end_confirm
-                if end_frame - start_frame + 1 >= min_rally:
-                    segments.append(Segment(start_frame=start_frame, end_frame=end_frame))
-                    last_end = end_frame
-                in_rally = False
-                active_run = 0
-                idle_run = 0
-
-    if in_rally:
-        end_frame = len(active_prob := activity_prob) - 1
-        if end_frame - start_frame + 1 >= min_rally:
-            segments.append(Segment(start_frame=start_frame, end_frame=end_frame))
-
-    merged: List[Segment] = []
-    merge_gap = int(round(0.8 * fps))
-    for segment in segments:
-        if not merged:
-            merged.append(segment)
-            continue
-        prev = merged[-1]
-        if segment.start_frame - prev.end_frame <= merge_gap:
-            merged[-1] = Segment(start_frame=prev.start_frame, end_frame=segment.end_frame)
-        else:
-            merged.append(segment)
-
-    return merged
+    return decode_segments_from_smooth(smooth, fps, config)
 
 
 def _segments_activity_stats(segments: List[Segment], total_frames: int) -> tuple[int, float, float]:
@@ -364,12 +381,28 @@ def detect_segments_robust(
     best_score = -1e9
 
     total_frames = len(activity_prob)
+    smooth_cache: dict[int, np.ndarray] = {}
+    active_cache: dict[tuple[int, float], np.ndarray] = {}
 
-    for threshold in threshold_candidates:
-        for start_confirm in start_candidates:
-            for end_confirm in end_candidates:
-                for min_rally in min_rally_candidates:
-                    for smooth_window in smooth_candidates:
+    for smooth_window in smooth_candidates:
+        smooth = smooth_cache.get(smooth_window)
+        if smooth is None:
+            smooth = moving_average(activity_prob, max(1, smooth_window))
+            smooth_cache[smooth_window] = smooth
+
+        for threshold in threshold_candidates:
+            active_key = (smooth_window, float(threshold))
+            active = active_cache.get(active_key)
+            if active is None:
+                active = smooth >= float(threshold)
+                active_cache[active_key] = active
+
+            if not np.any(active):
+                continue
+
+            for start_confirm in start_candidates:
+                for end_confirm in end_candidates:
+                    for min_rally in min_rally_candidates:
                         trial_config = DetectorConfig(
                             smooth_window_frames=smooth_window,
                             start_confirm_sec=start_confirm,
@@ -378,7 +411,7 @@ def detect_segments_robust(
                             min_gap_sec=config.min_gap_sec,
                             threshold=float(threshold),
                         )
-                        segments = decode_segments(activity_prob, fps, trial_config)
+                        segments = _decode_segments_from_active(active, fps, trial_config)
                         count, active_ratio, avg_duration = _segments_activity_stats(segments, total_frames)
                         if count == 0:
                             continue
