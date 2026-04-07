@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import time
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
@@ -105,6 +106,7 @@ def process_video(
     post_pad_sec: float,
 
 ) -> tuple[str, dict[str, Any], list[str], str, Any, str | None, dict[str, str]]:
+    total_t0 = time.perf_counter()
     video_path = _resolve_uploaded_path(video_file)
     if video_path is None:
         return "Please drag/drop a video file.", {}, [], "", gr.update(choices=[], value=None), None, {}
@@ -120,8 +122,10 @@ def process_video(
 
     output_dir = _build_output_dir(OUTPUTS_ROOT, video_path)
 
+    t0 = time.perf_counter()
     features, fps, frame_count, width, height = extract_frame_features(video_path)
     activity_prob = build_activity_probability(features, model=model)
+    extract_build_sec = time.perf_counter() - t0
 
     config = DetectorConfig(
         smooth_window_frames=max(1, int(smooth_window)),
@@ -132,12 +136,15 @@ def process_video(
         threshold=float(threshold),
     )
 
+    t1 = time.perf_counter()
     segments, diagnostics = detect_segments_auto(activity_prob, fps, config)
     segments = filter_rally_segments(segments, activity_prob, fps, config)
     diagnostics.count = len(segments)
+    detect_sec = time.perf_counter() - t1
 
     labeled_chunks = build_labeled_timeline_chunks(segments, frame_count, fps)
 
+    t2 = time.perf_counter()
     export_segments(
         video_path=video_path,
         chunks=labeled_chunks,
@@ -149,9 +156,18 @@ def process_video(
         post_pad_sec=float(post_pad_sec),
     )
     save_metadata(labeled_chunks, output_dir, fps, activity_prob, diagnostics=diagnostics)
+    export_meta_sec = time.perf_counter() - t2
+    total_sec = time.perf_counter() - total_t0
 
     segments_path = output_dir / "segments.json"
     payload = json.loads(segments_path.read_text(encoding="utf-8"))
+    detection_payload = payload.setdefault("detection", {})
+    detection_payload["timing_sec"] = {
+        "extract_and_activity": round(float(extract_build_sec), 3),
+        "detect_and_filter": round(float(detect_sec), 3),
+        "export_and_metadata": round(float(export_meta_sec), 3),
+        "total": round(float(total_sec), 3),
+    }
 
     rally_videos = sorted(str(path) for path in output_dir.glob("point_*/point_*.mp4"))
     break_videos = sorted(str(path) for path in output_dir.glob("break_*/break_*.mp4"))
@@ -169,6 +185,7 @@ def process_video(
             "No points detected from this run. "
             f"Frames: {frame_count} | FPS: {fps:.2f} | Preset: {diagnostics.preset} | "
             f"Threshold: {diagnostics.used_threshold:.2f} | Model: {model_name}. "
+            f"Time(s): detect={detect_sec:.2f}, total={total_sec:.2f}. "
             "Try lowering Threshold and End Confirm in Advanced Settings."
         )
     else:
@@ -176,7 +193,8 @@ def process_video(
             f"Done. Detected points: {len(segments)} | "
             f"Frames: {frame_count} | FPS: {fps:.2f} | Preset: {diagnostics.preset} | "
             f"Threshold: {diagnostics.used_threshold:.2f} | "
-            f"Quality: {diagnostics.score:.2f} | Model: {model_name}"
+            f"Quality: {diagnostics.score:.2f} | Model: {model_name} | "
+            f"Time(s): extract={extract_build_sec:.2f}, detect={detect_sec:.2f}, export={export_meta_sec:.2f}, total={total_sec:.2f}"
         )
 
     return (

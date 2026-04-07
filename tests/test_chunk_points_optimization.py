@@ -12,6 +12,9 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from chunk_points import (  # noqa: E402
+    _build_runs,
+    _decode_segments_from_active,
+    _decode_segments_from_runs,
     DetectorConfig,
     decode_segments,
     decode_segments_from_smooth,
@@ -51,6 +54,33 @@ class ChunkPointsOptimizationTests(unittest.TestCase):
         empty = np.array([], dtype=np.float32)
         segments = decode_segments_from_smooth(empty, 30.0, config)
         self.assertEqual(segments, [])
+
+    def test_decode_from_runs_matches_active_decode(self) -> None:
+        rng = np.random.default_rng(13)
+        active = rng.random(2000) > 0.62
+
+        # Inject longer activity and inactivity spans to exercise confirmations.
+        active[120:260] = True
+        active[260:290] = False
+        active[290:420] = True
+        active[1000:1150] = True
+        active = np.asarray(active, dtype=bool)
+
+        fps = 30.0
+        configs = [
+            DetectorConfig(start_confirm_sec=0.4, end_confirm_sec=0.8, min_rally_sec=1.2, min_gap_sec=0.7),
+            DetectorConfig(start_confirm_sec=0.6, end_confirm_sec=1.0, min_rally_sec=2.0, min_gap_sec=1.2),
+            DetectorConfig(start_confirm_sec=0.3, end_confirm_sec=0.6, min_rally_sec=1.0, min_gap_sec=0.5),
+        ]
+
+        runs = _build_runs(active)
+        for config in configs:
+            expected = _decode_segments_from_active(active, fps, config)
+            actual = _decode_segments_from_runs(runs, len(active), fps, config)
+            self.assertEqual(
+                [(segment.start_frame, segment.end_frame) for segment in expected],
+                [(segment.start_frame, segment.end_frame) for segment in actual],
+            )
 
 
 if __name__ == "__main__":

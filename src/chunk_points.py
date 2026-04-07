@@ -114,6 +114,83 @@ def _decode_segments_from_active(
     return merged
 
 
+def _build_runs(active: np.ndarray) -> List[tuple[bool, int, int]]:
+    if len(active) == 0:
+        return []
+
+    changes = np.flatnonzero(active[1:] != active[:-1]) + 1
+    starts = np.concatenate((np.array([0], dtype=np.int64), changes))
+    ends = np.concatenate((changes - 1, np.array([len(active) - 1], dtype=np.int64)))
+    values = active[starts]
+
+    runs: List[tuple[bool, int, int]] = []
+    for value, start, end in zip(values, starts, ends):
+        runs.append((bool(value), int(start), int(end)))
+    return runs
+
+
+def _decode_segments_from_runs(
+    runs: List[tuple[bool, int, int]],
+    total_frames: int,
+    fps: float,
+    config: DetectorConfig,
+) -> List[Segment]:
+    if total_frames <= 0 or not runs:
+        return []
+
+    start_confirm = max(1, int(round(config.start_confirm_sec * fps)))
+    end_confirm = max(1, int(round(config.end_confirm_sec * fps)))
+    min_rally = max(1, int(round(config.min_rally_sec * fps)))
+    min_gap = max(1, int(round(config.min_gap_sec * fps)))
+
+    segments: List[Segment] = []
+    in_rally = False
+    start_frame = 0
+    last_end = -10**9
+
+    for is_active, run_start, run_end in runs:
+        run_len = run_end - run_start + 1
+
+        if not in_rally:
+            if not is_active or run_len < start_confirm:
+                continue
+
+            trigger_index = run_start + start_confirm - 1
+            if trigger_index - last_end >= min_gap:
+                start_frame = run_start
+                in_rally = True
+            continue
+
+        if is_active:
+            continue
+
+        if run_len >= end_confirm:
+            end_frame = run_start - 1
+            if end_frame - start_frame + 1 >= min_rally:
+                segments.append(Segment(start_frame=start_frame, end_frame=end_frame))
+                last_end = end_frame
+            in_rally = False
+
+    if in_rally:
+        end_frame = total_frames - 1
+        if end_frame - start_frame + 1 >= min_rally:
+            segments.append(Segment(start_frame=start_frame, end_frame=end_frame))
+
+    merged: List[Segment] = []
+    merge_gap = int(round(0.8 * fps))
+    for segment in segments:
+        if not merged:
+            merged.append(segment)
+            continue
+        prev = merged[-1]
+        if segment.start_frame - prev.end_frame <= merge_gap:
+            merged[-1] = Segment(start_frame=prev.start_frame, end_frame=segment.end_frame)
+        else:
+            merged.append(segment)
+
+    return merged
+
+
 def decode_segments_from_smooth(
     smooth: np.ndarray,
     fps: float,
@@ -383,6 +460,7 @@ def detect_segments_robust(
     total_frames = len(activity_prob)
     smooth_cache: dict[int, np.ndarray] = {}
     active_cache: dict[tuple[int, float], np.ndarray] = {}
+    runs_cache: dict[tuple[int, float], List[tuple[bool, int, int]]] = {}
 
     for smooth_window in smooth_candidates:
         smooth = smooth_cache.get(smooth_window)
@@ -400,6 +478,11 @@ def detect_segments_robust(
             if not np.any(active):
                 continue
 
+            runs = runs_cache.get(active_key)
+            if runs is None:
+                runs = _build_runs(active)
+                runs_cache[active_key] = runs
+
             for start_confirm in start_candidates:
                 for end_confirm in end_candidates:
                     for min_rally in min_rally_candidates:
@@ -411,7 +494,7 @@ def detect_segments_robust(
                             min_gap_sec=config.min_gap_sec,
                             threshold=float(threshold),
                         )
-                        segments = _decode_segments_from_active(active, fps, trial_config)
+                        segments = _decode_segments_from_runs(runs, total_frames, fps, trial_config)
                         count, active_ratio, avg_duration = _segments_activity_stats(segments, total_frames)
                         if count == 0:
                             continue
