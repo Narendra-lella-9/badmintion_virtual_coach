@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
@@ -43,6 +44,39 @@ class DetectionDiagnostics:
     count: int
     active_ratio: float
     avg_duration_sec: float
+    robust_elapsed_ms: float = 0.0
+    robust_thresholds_scanned: int = 0
+    robust_thresholds_pruned: int = 0
+    robust_decode_trials: int = 0
+
+
+@dataclass
+class RobustSweepStats:
+    thresholds_scanned: int = 0
+    thresholds_skipped_no_active: int = 0
+    thresholds_skipped_impossible: int = 0
+    decode_trials: int = 0
+    elapsed_ms: float = 0.0
+
+
+@dataclass
+class _RobustSweepContext:
+    # Reused across preset evaluations in detect_segments_auto for one activity signal.
+    smooth_cache: dict[int, np.ndarray]
+    active_cache: dict[tuple[int, float], np.ndarray]
+    runs_cache: dict[tuple[int, float], List[tuple[bool, int, int]]]
+    decode_cache: dict[tuple[int, float, float, float, float, float], List[Segment]]
+    stats_cache: dict[tuple[int, float, float, float, float, float], tuple[int, float, float]]
+
+
+def _make_sweep_context() -> _RobustSweepContext:
+    return _RobustSweepContext(
+        smooth_cache={},
+        active_cache={},
+        runs_cache={},
+        decode_cache={},
+        stats_cache={},
+    )
 
 
 def moving_average(values: np.ndarray, window: int) -> np.ndarray:
@@ -189,6 +223,19 @@ def _decode_segments_from_runs(
             merged.append(segment)
 
     return merged
+
+
+def _runs_activity_summary(runs: List[tuple[bool, int, int]]) -> tuple[int, int]:
+    active_frames = 0
+    max_active_run = 0
+    for is_active, run_start, run_end in runs:
+        if not is_active:
+            continue
+        run_len = run_end - run_start + 1
+        active_frames += run_len
+        if run_len > max_active_run:
+            max_active_run = run_len
+    return active_frames, max_active_run
 
 
 def decode_segments_from_smooth(
@@ -438,9 +485,15 @@ def detect_segments_robust(
     activity_prob: np.ndarray,
     fps: float,
     config: DetectorConfig,
+    sweep_ctx: _RobustSweepContext | None = None,
+    sweep_stats: RobustSweepStats | None = None,
 ) -> tuple[List[Segment], float]:
+    started = time.perf_counter()
+    stats = sweep_stats if sweep_stats is not None else RobustSweepStats()
+
     base_segments = decode_segments(activity_prob, fps, config)
     if base_segments:
+        stats.elapsed_ms += (time.perf_counter() - started) * 1000.0
         return base_segments, config.threshold
 
     threshold_candidates = np.linspace(0.2, 0.75, num=23)
@@ -458,44 +511,72 @@ def detect_segments_robust(
     best_score = -1e9
 
     total_frames = len(activity_prob)
-    smooth_cache: dict[int, np.ndarray] = {}
-    active_cache: dict[tuple[int, float], np.ndarray] = {}
-    runs_cache: dict[tuple[int, float], List[tuple[bool, int, int]]] = {}
+    ctx = sweep_ctx or _make_sweep_context()
+    thresholds_array = np.asarray(threshold_candidates, dtype=np.float32)
+    min_start_confirm_frames = max(1, int(round(min(start_candidates) * fps)))
+    min_rally_frames = max(1, int(round(min(min_rally_candidates) * fps)))
 
     for smooth_window in smooth_candidates:
-        smooth = smooth_cache.get(smooth_window)
+        smooth = ctx.smooth_cache.get(smooth_window)
         if smooth is None:
             smooth = moving_average(activity_prob, max(1, smooth_window))
-            smooth_cache[smooth_window] = smooth
+            ctx.smooth_cache[smooth_window] = smooth
 
-        for threshold in threshold_candidates:
+        active_matrix = smooth[:, None] >= thresholds_array[None, :]
+
+        for threshold_idx, threshold in enumerate(threshold_candidates):
+            stats.thresholds_scanned += 1
             active_key = (smooth_window, float(threshold))
-            active = active_cache.get(active_key)
+            active = ctx.active_cache.get(active_key)
             if active is None:
-                active = smooth >= float(threshold)
-                active_cache[active_key] = active
+                active = active_matrix[:, threshold_idx]
+                ctx.active_cache[active_key] = active
 
             if not np.any(active):
+                stats.thresholds_skipped_no_active += 1
                 continue
 
-            runs = runs_cache.get(active_key)
+            runs = ctx.runs_cache.get(active_key)
             if runs is None:
                 runs = _build_runs(active)
-                runs_cache[active_key] = runs
+                ctx.runs_cache[active_key] = runs
+
+            active_frames, max_active_run = _runs_activity_summary(runs)
+            # Safe pruning: skip thresholds that cannot satisfy any start/min-rally requirement.
+            if active_frames < min_rally_frames or max_active_run < min_start_confirm_frames:
+                stats.thresholds_skipped_impossible += 1
+                continue
 
             for start_confirm in start_candidates:
                 for end_confirm in end_candidates:
                     for min_rally in min_rally_candidates:
-                        trial_config = DetectorConfig(
-                            smooth_window_frames=smooth_window,
-                            start_confirm_sec=start_confirm,
-                            end_confirm_sec=end_confirm,
-                            min_rally_sec=min_rally,
-                            min_gap_sec=config.min_gap_sec,
-                            threshold=float(threshold),
+                        decode_key = (
+                            smooth_window,
+                            float(threshold),
+                            float(start_confirm),
+                            float(end_confirm),
+                            float(min_rally),
+                            float(config.min_gap_sec),
                         )
-                        segments = _decode_segments_from_runs(runs, total_frames, fps, trial_config)
-                        count, active_ratio, avg_duration = _segments_activity_stats(segments, total_frames)
+                        segments = ctx.decode_cache.get(decode_key)
+                        if segments is None:
+                            stats.decode_trials += 1
+                            trial_config = DetectorConfig(
+                                smooth_window_frames=smooth_window,
+                                start_confirm_sec=start_confirm,
+                                end_confirm_sec=end_confirm,
+                                min_rally_sec=min_rally,
+                                min_gap_sec=config.min_gap_sec,
+                                threshold=float(threshold),
+                            )
+                            segments = _decode_segments_from_runs(runs, total_frames, fps, trial_config)
+                            ctx.decode_cache[decode_key] = segments
+
+                        stats = ctx.stats_cache.get(decode_key)
+                        if stats is None:
+                            stats = _segments_activity_stats(segments, total_frames)
+                            ctx.stats_cache[decode_key] = stats
+                        count, active_ratio, avg_duration = stats
                         if count == 0:
                             continue
 
@@ -521,6 +602,7 @@ def detect_segments_robust(
                             best_threshold = float(threshold)
 
     if best_segments:
+        stats.elapsed_ms += (time.perf_counter() - started) * 1000.0
         return best_segments, best_threshold
 
     smooth = moving_average(activity_prob, max(5, config.smooth_window_frames))
@@ -567,8 +649,10 @@ def detect_segments_robust(
                 merged.append(segment)
 
         if merged:
+            stats.elapsed_ms += (time.perf_counter() - started) * 1000.0
             return merged, thr
 
+    stats.elapsed_ms += (time.perf_counter() - started) * 1000.0
     return [], best_threshold
 
 
@@ -635,8 +719,28 @@ def detect_segments_auto(
         avg_duration_sec=0.0,
     )
 
+    sweep_ctx = _make_sweep_context()
+    total_elapsed_ms = 0.0
+    total_thresholds_scanned = 0
+    total_thresholds_pruned = 0
+    total_decode_trials = 0
+
     for preset_name, preset_config in presets:
-        segments, used_threshold = detect_segments_robust(activity_prob, fps, preset_config)
+        sweep_stats = RobustSweepStats()
+        segments, used_threshold = detect_segments_robust(
+            activity_prob,
+            fps,
+            preset_config,
+            sweep_ctx=sweep_ctx,
+            sweep_stats=sweep_stats,
+        )
+        total_elapsed_ms += sweep_stats.elapsed_ms
+        total_thresholds_scanned += sweep_stats.thresholds_scanned
+        total_thresholds_pruned += (
+            sweep_stats.thresholds_skipped_no_active + sweep_stats.thresholds_skipped_impossible
+        )
+        total_decode_trials += sweep_stats.decode_trials
+
         score, count, active_ratio, avg_duration_sec = _quality_score(segments, fps, total_frames)
         if score > best_diag.score:
             best_segments = segments
@@ -648,6 +752,11 @@ def detect_segments_auto(
                 active_ratio=active_ratio,
                 avg_duration_sec=avg_duration_sec,
             )
+
+    best_diag.robust_elapsed_ms = total_elapsed_ms
+    best_diag.robust_thresholds_scanned = total_thresholds_scanned
+    best_diag.robust_thresholds_pruned = total_thresholds_pruned
+    best_diag.robust_decode_trials = total_decode_trials
 
     return best_segments, best_diag
 
@@ -837,6 +946,10 @@ def save_metadata(
             "quality_score": float(diagnostics.score),
             "active_ratio": float(diagnostics.active_ratio),
             "avg_point_duration_sec": float(diagnostics.avg_duration_sec),
+            "robust_elapsed_ms": float(diagnostics.robust_elapsed_ms),
+            "robust_thresholds_scanned": int(diagnostics.robust_thresholds_scanned),
+            "robust_thresholds_pruned": int(diagnostics.robust_thresholds_pruned),
+            "robust_decode_trials": int(diagnostics.robust_decode_trials),
         }
 
     with (output_dir / "segments.json").open("w", encoding="utf-8") as file_obj:
@@ -923,6 +1036,13 @@ def main() -> None:
     print(f"Model: {model_name}")
     print(f"Preset: {diagnostics.preset}")
     print(f"Used threshold: {diagnostics.used_threshold:.3f}")
+    print(
+        "Robust sweep: "
+        f"elapsed_ms={diagnostics.robust_elapsed_ms:.2f}, "
+        f"thresholds={diagnostics.robust_thresholds_scanned}, "
+        f"pruned={diagnostics.robust_thresholds_pruned}, "
+        f"decode_trials={diagnostics.robust_decode_trials}"
+    )
     print(f"Output: {args.output_dir}")
 
 

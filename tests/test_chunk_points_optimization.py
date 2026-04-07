@@ -16,6 +16,7 @@ from chunk_points import (  # noqa: E402
     _decode_segments_from_active,
     _decode_segments_from_runs,
     DetectorConfig,
+    detect_segments_auto,
     decode_segments,
     decode_segments_from_smooth,
     moving_average,
@@ -81,6 +82,30 @@ class ChunkPointsOptimizationTests(unittest.TestCase):
                 [(segment.start_frame, segment.end_frame) for segment in expected],
                 [(segment.start_frame, segment.end_frame) for segment in actual],
             )
+
+    def test_auto_detection_reports_robust_sweep_stats(self) -> None:
+        rng = np.random.default_rng(23)
+        activity = rng.random(1800, dtype=np.float32)
+        activity[180:360] += 0.4
+        activity[900:1150] += 0.35
+        activity = np.clip(activity, 0.0, 1.0)
+
+        config = DetectorConfig(
+            smooth_window_frames=9,
+            start_confirm_sec=0.55,
+            end_confirm_sec=0.95,
+            min_rally_sec=1.7,
+            min_gap_sec=0.9,
+            threshold=0.5,
+        )
+
+        _, diagnostics = detect_segments_auto(activity, 30.0, config)
+
+        self.assertGreaterEqual(diagnostics.robust_elapsed_ms, 0.0)
+        self.assertGreaterEqual(diagnostics.robust_thresholds_scanned, 0)
+        self.assertGreaterEqual(diagnostics.robust_thresholds_pruned, 0)
+        self.assertGreaterEqual(diagnostics.robust_decode_trials, 0)
+        self.assertLessEqual(diagnostics.robust_thresholds_pruned, diagnostics.robust_thresholds_scanned)
 
 
 if __name__ == "__main__":
