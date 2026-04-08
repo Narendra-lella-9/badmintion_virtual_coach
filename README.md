@@ -119,3 +119,27 @@ python src/chunk_points.py --video "E:\videos\match.mp4" --output-dir "E:\videos
   - `--end-confirm-sec 1.0`
   - `--min-rally-sec 2.0`
   - `--min-gap-sec 1.2`
+
+## 5) Results
+
+The following result visualizations are available in `src/results`:
+
+### Rally duration distribution
+
+![Rally Duration](src/results/rally_duration.jpeg)
+
+### Shorts count
+
+![Shorts Count](src/results/shorts_count.jpeg)
+
+### Player speed trend
+
+![Player Speed](src/results/player_speed.jpeg)
+
+### Court heatmap
+
+![Court Heatmap](src/results/court_heatmap.png)
+
+### Court area coverage
+
+![Court Area Coverage](src/results/court_area_coverage.jpeg)
